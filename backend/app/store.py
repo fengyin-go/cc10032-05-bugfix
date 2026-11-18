@@ -89,6 +89,30 @@ class Store:
         self._channels: dict[str, DataChannelEvent] = {}
         # 失败恢复记录：recovery_id → FailureRecovery
         self._failures: dict[str, FailureRecovery] = {}
+        # 领域附属数据（旁路快照、批量回执、导入台账）。
+        # 与业务主表分开存放，避免污染模块列表和运营概览的模块计数。
+        self._aux: dict[str, list[dict[str, Any]]] = {}
+
+    # ---- 领域附属数据 ----
+
+    def aux(self, name: str) -> list[dict[str, Any]]:
+        """返回领域附属数据表；首次访问时创建空表。"""
+        return self._aux.setdefault(name, [])
+
+    def reset_aux(self, name: str | None = None) -> None:
+        """清空附属数据，测试和重放场景使用。"""
+        if name is None:
+            self._aux.clear()
+        else:
+            self._aux[name] = []
+
+    def snapshot_aux(self, *names: str) -> dict[str, list[dict[str, Any]]]:
+        """快照若干附属数据表，用于导入失败时回滚。"""
+        return {name: copy.deepcopy(self._aux.get(name, [])) for name in names}
+
+    def restore_aux(self, snapshot: dict[str, list[dict[str, Any]]]) -> None:
+        for name, rows in snapshot.items():
+            self._aux[name] = copy.deepcopy(rows)
 
     # ---- 跨模块数据通道 ----
 

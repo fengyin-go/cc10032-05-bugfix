@@ -10,13 +10,18 @@
 ```text
 .
 ├── frontend/                 Vue 3 + Vite + TypeScript 前端
-│   ├── src/views/WorkbenchView.vue|tsx  全部模块共享工作台
-│   ├── src/data/modules.ts              18个业务模块配置
+│   ├── src/views/WorkbenchView.vue|tsx  大部分模块共享工作台
+│   ├── src/views/LateHandlerView.vue    迟到处理专属页（导入/回执/导出）
+│   ├── src/views/BackfillJobView.vue    补数任务专属页（区段覆盖/清单下载）
+│   ├── src/domain/lateBypass.ts         迟到旁路与补数任务的接口封装
+│   ├── src/data/modules.ts              业务模块配置
 │   ├── src/api/              统一请求封装
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
+│   ├── app/routers/late.py      迟到处理/补数任务的文件接口
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
+│   ├── app/services/late_bypass.py  迟到旁路、区段切分与清单校验的共享逻辑
 │   ├── app/services/base.py     共享服务骨架
 │   └── app/store.py          内存数据仓库与示例数据
 ├── .gitignore
@@ -73,11 +78,47 @@ npm run dev
 
 ## 约定
 
-- 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。
+- 大部分模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由；
+  迟到处理与补数任务有专属页面，文件导入导出和覆盖核对走
+  `backend/app/routers/late.py`。
 - 每个模块仍保留独立`backend/app/services/<模块>.py`；纯前端保留
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 迟到处理 → 补数任务
+
+这条链路是同一个根因的两端，改动时两边要一起看：
+
+```text
+迟到事件（CSV/JSON）
+  └─ 判定：event_time < 水位 - 允许延迟（相等算准时）
+      └─ 阈值：late_ratio > 阈值百分比 / 100（相等不触发）
+          └─ 迟到旁路数据：按源端 + 事件时间切区段，带版本
+              └─ 补数作业：每个未覆盖区段一条可执行作业
+                  └─ 导出清单：迟到明细 + 区段 + 作业，可回传校验
+```
+
+- 阈值取自策略「阈值百分比」，按百分数解析（`5` 就是 5%）。配置为空或
+  不是 0-100 的数值时回退策略默认值 5%，不会猜成 0.1 之类的小比例。
+- 只有越过阈值才写旁路数据和补数作业；未越过阈值只留批量回执，页面能看到
+  本批实际采用的比例与阈值。
+- 同一份文件重复导入只生效一次；同一事件在第二份文件边界里再出现也不重复计数。
+- 同一迟到范围只保留一条可执行作业：再次越过阈值扩展原作业范围并追加进度；
+  暂停时可选扩大原作业（`extend`）或关闭旧作业新建分段作业（`split`）。
+- 导出清单（`GET /api/late_handler/{策略}/export`）记录校验和；其它页面回传时
+  先校验覆盖与明细，再幂等入库，校验不通过则整批退回、不改动原数据。
+
+主要接口：
+
+| 用途 | 接口 |
+| --- | --- |
+| 读取迟到事件并生成作业 | `POST /api/late_handler/{策略}/ingest` |
+| 迟到处理页数据（实际阈值/比例/覆盖） | `GET /api/late_handler/{策略}/processing` |
+| 导出 / 校验 / 接收同源清单 | `GET .../export`、`POST .../verify`、`POST .../import` |
+| 补数页面（区段 × 作业覆盖） | `GET /api/backfill_job/console` |
+| 补数清单下载 / 校验 | `GET /api/backfill_job/manifest`、`POST /api/backfill_job/verify` |
+| 暂停作业分段重建 | `POST /api/backfill_job/{id}/split` |
 
 领域：数据工程
 子方向：数据分析与数据应用

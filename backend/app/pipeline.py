@@ -227,29 +227,68 @@ def create_backfill_from_late(
     target_index: str,
     source_name: str,
 ) -> dict[str, Any]:
-    """根据迟到数据自动生成补数任务。"""
+    """根据迟到数据自动生成补数任务。
+
+    作业创建走迟到处理领域服务，和导入入口共用同一条规则：同一迟到范围
+    只保留一条待执行作业，重复越过阈值只在原作业上追加进度。
+    """
     if not late_entries:
         return {"created": False, "reason": "无迟到数据需要补数"}
-    min_ts = min(le.event_time for le in late_entries)
-    max_ts = max(le.event_time for le in late_entries)
-    job = {
-        "id": max(
-            (int(r.get("id", 0)) for r in store.rows("backfill_job")), default=0
-        ) + 1,
-        "作业名称": f"自动补数_{source_name}_{int(min_ts)}",
-        "目标指标": target_index,
-        "补数范围": f"{int(min_ts)}-{int(max_ts)}",
-        "并行度": min(len(late_entries), 8),
-        "起始位点": str(int(min_ts)),
-        "截止位点": str(int(max_ts)),
-        "进度比例": "0%",
-        "status": "待执行",
-        "pending": True,
-        "abnormal": False,
-        "_late_count": len(late_entries),
+
+    from app.services.late_handler import LateHandlerService
+
+    service = LateHandlerService()
+    segment = {
+        "区段ID": f"{source_name}|{target_index}",
+        "源端": source_name,
+        "起始时间": min(le.event_time for le in late_entries),
+        "截止时间": max(le.event_time for le in late_entries),
+        "迟到事件数": len(late_entries),
+        "事件列表": [
+            {
+                "event_id": str(le.original.get("event_id", f"{source_name}-{le.event_time}")),
+                "event_time": le.event_time,
+                "watermark": le.expected_watermark,
+            }
+            for le in late_entries
+        ],
+        "事件ID列表": [
+            str(le.original.get("event_id", f"{source_name}-{le.event_time}"))
+            for le in late_entries
+        ],
+        "显式区段": None,
     }
-    store.rows("backfill_job").append(job)
-    return {"created": True, "job_id": job["id"], "job_name": job["作业名称"]}
+    policy_name = f"pipeline_{target_index}"
+    if service.find_policy(policy_name) is None:
+        store.rows("late_handler").append({
+            "id": max(
+                (int(r.get("id", 0)) for r in store.rows("late_handler")), default=0
+            ) + 1,
+            "策略名称": policy_name,
+            "允许延迟": "10",
+            "迟到动作": "bypass",
+            "旁路输出": "自动补数旁路",
+            "计数方式": "60",
+            "阈值百分比": "5",
+            "标记字段": "_late_mark",
+            "status": "已启用",
+            "pending": False,
+            "abnormal": False,
+        })
+    job, created = service._ensure_job_for_segment(
+        policy_name=policy_name,
+        segment=segment,
+        batch_id="pipeline",
+        settings=service.resolve_policy_settings(policy_name),
+        covered_events=len(late_entries),
+    )
+    return {
+        "created": created,
+        "job_id": job.get("id"),
+        "job_name": job.get("作业名称"),
+        "range": job.get("补数范围"),
+        "reused": not created,
+    }
 
 
 # ---- 链路3: join_stream → calc_operator → aggregate_sink → checkpoint_mgr ----
